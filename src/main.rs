@@ -32,6 +32,12 @@ enum Command {
         pid: Option<i64>,
         url: String,
     },
+    Text {
+        command: String,
+    },
+    Heos {
+        url: String,
+    },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -114,6 +120,12 @@ impl Denon {
             input.to_protocol_name()
         )?)
     }
+    fn text_command(&mut self, command: String) -> Result<()> {
+        Ok(writeln!(self.connect_text()?, "{command}")?)
+    }
+    fn heos_command(&mut self, url: String) -> Result<()> {
+        Ok(writeln!(self.connect_heos()?, "{url}")?)
+    }
     fn get_players(&mut self) -> Result<Vec<heos::Player>> {
         let mut session = self.connect_heos()?;
         writeln!(&mut session, "heos://player/get_players")?;
@@ -174,6 +186,12 @@ fn main() -> Result<()> {
         }
         Command::PlayUrl { pid, url } => {
             denon.play_url(pid, url)?;
+        }
+        Command::Text { command } => {
+            denon.text_command(command)?;
+        }
+        Command::Heos { url } => {
+            denon.text_command(url)?;
         }
     }
     Ok(())
