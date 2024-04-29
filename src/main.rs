@@ -1,7 +1,12 @@
-use std::{io::Write, net::TcpStream};
+use std::{
+    io::{BufRead, BufReader, Write},
+    net::TcpStream,
+    thread::{spawn, JoinHandle},
+};
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use color_eyre::{eyre::eyre, Result};
+use rustyline::{error::ReadlineError, DefaultEditor, ExternalPrinter};
 use serde::Deserialize;
 
 #[derive(Parser)]
@@ -32,11 +37,22 @@ enum Command {
         pid: Option<i64>,
         url: String,
     },
+    /// Send an arbitrary text command.
+    ///
+    /// If no command is provided, interactive shell will be opened.
     Text {
-        command: String,
+        command: Option<String>,
     },
+    /// Send an arbitrary HEOS command.
+    ///
+    /// If no command is provided, interactive shell will be opened.
     Heos {
-        url: String,
+        url: Option<String>,
+        /// Subscribe to events automatically.
+        ///
+        /// Only applied for interactive shell.
+        #[arg(long)]
+        subscribe: bool,
     },
 }
 
@@ -120,11 +136,48 @@ impl Denon {
             input.to_protocol_name()
         )?)
     }
-    fn text_command(&mut self, command: String) -> Result<()> {
-        Ok(writeln!(self.connect_text()?, "{command}")?)
+    fn text_command(&mut self, command: Option<String>) -> Result<()> {
+        if let Some(command) = command {
+            Ok(writeln!(self.connect_text()?, "{command}")?)
+        } else {
+            let stream = self.connect_text()?.try_clone()?;
+            self.shell_helper(stream, b'\r')
+        }
     }
-    fn heos_command(&mut self, url: String) -> Result<()> {
-        Ok(writeln!(self.connect_heos()?, "{url}")?)
+    fn heos_command(&mut self, url: Option<String>, subscribe: bool) -> Result<()> {
+        if let Some(url) = url {
+            Ok(writeln!(self.connect_heos()?, "{url}")?)
+        } else {
+            let mut stream = self.connect_heos()?.try_clone()?;
+            if subscribe {
+                writeln!(stream, "heos://system/register_for_change_events?enable=on")?;
+            }
+            self.shell_helper(stream, b'\n')
+        }
+    }
+    fn shell_helper(&mut self, stream: TcpStream, split: u8) -> Result<()> {
+        let mut rl = rustyline::Editor::<(), _>::with_history(
+            rustyline::Config::default(),
+            rustyline::history::MemHistory::new(),
+        )?;
+        let mut printer = rl.create_external_printer()?;
+        let rx = stream.try_clone()?;
+        let _rxer: JoinHandle<Result<()>> = spawn(move || {
+            let mut bufr = BufReader::new(rx);
+            loop {
+                let mut s = Vec::new();
+                bufr.read_until(split, &mut s)?;
+                printer.print(String::from_utf8(s)?)?;
+            }
+        });
+        let stream = self.connect_text()?;
+        loop {
+            let command = match rl.readline(">>> ") {
+                Err(ReadlineError::Eof) => return Ok(()),
+                c => c?,
+            };
+            writeln!(stream, "{command}")?;
+        }
     }
     fn get_players(&mut self) -> Result<Vec<heos::Player>> {
         let mut session = self.connect_heos()?;
@@ -132,7 +185,7 @@ impl Denon {
         let mut de = serde_json::Deserializer::from_reader(session);
         let response = heos::Response::<Vec<heos::Player>>::deserialize(&mut de)?;
         if matches!(response.heos.result, heos::HeosResult::Fail) {
-            return Err(eyre!("failed to get players: {:?}", response))
+            return Err(eyre!("failed to get players: {:?}", response));
         }
         Ok(response.payload)
     }
@@ -150,11 +203,14 @@ impl Denon {
             self.get_first_player_id()?
         };
         let mut session = self.connect_heos()?;
-        writeln!(&mut session, "heos://browse/play_stream?pid={pid}&url={url}")?;
+        writeln!(
+            &mut session,
+            "heos://browse/play_stream?pid={pid}&url={url}"
+        )?;
         let mut de = serde_json::Deserializer::from_reader(session);
         let response = heos::Response::<()>::deserialize(&mut de)?;
         if matches!(response.heos.result, heos::HeosResult::Fail) {
-            return Err(eyre!("failed to get players: {:?}", response))
+            return Err(eyre!("failed to get players: {:?}", response));
         }
         Ok(response.payload)
     }
@@ -190,8 +246,8 @@ fn main() -> Result<()> {
         Command::Text { command } => {
             denon.text_command(command)?;
         }
-        Command::Heos { url } => {
-            denon.text_command(url)?;
+        Command::Heos { url, subscribe } => {
+            denon.heos_command(url, subscribe)?;
         }
     }
     Ok(())
